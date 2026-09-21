@@ -124,3 +124,26 @@ export async function searchRobu(query: string, limit = 12): Promise<Offer[]> {
   }
   return [...seen.values()];
 }
+
+/**
+ * robu's REAL product search resolver (typeahead). Unlike visibleMenuCategories
+ * (a fuzzy menu filter that misses bare ICs), `productSearch` matches exact part
+ * numbers — it's how the site's own search box finds e.g. STM32F765VIT6. It is
+ * capped (~8 results, no pagination) and exposes fewer fields (no images/
+ * categories), so it's a LIVE EXACT-LOOKUP tool, not a crawl source.
+ */
+const PRODUCT_SEARCH_QUERY =
+  "query BomPS($search:String!){ productSearch(search:$search){ data { products {" +
+  "id sku name slug price sale_price moq_price in_stock is_backorder } } } }";
+
+export async function productSearchRobu(query: string): Promise<Offer[]> {
+  const data = await gql(PRODUCT_SEARCH_QUERY, { search: query });
+  const products = (data?.productSearch?.data?.products ?? []) as any[];
+  const seen = new Map<string, Offer>();
+  for (const p of products) {
+    const o = toOffer(p); // images/categories absent -> null/[]; fine
+    const key = o.supplierProductId || o.url;
+    if (!seen.has(key)) seen.set(key, o);
+  }
+  return [...seen.values()];
+}

@@ -11,9 +11,11 @@
  * them across the candidate set so the lexical adjustments (±~0.6) are on a
  * comparable scale and can actually reorder near-ties.
  */
-import type { Env } from "./types";
+import type { Env, Offer } from "./types";
 import { lexicalAdjust, tokenize } from "./ranking";
 import { understandQuery, type Understanding } from "./understand";
+import { productSearchRobu, searchRobu } from "./scrapers/robu";
+import { WOO_SUPPLIERS, searchWoo } from "./scrapers/woocommerce";
 
 interface ResultRow {
   supplier: string;
@@ -51,12 +53,93 @@ export function handleOptions(env: Env): Response {
   return new Response(null, { headers: corsHeaders(env) });
 }
 
+function offerToRow(o: Offer): ResultRow {
+  const p = o.priceInr ?? null;
+  const r = o.regularPriceInr ?? null;
+  return {
+    supplier: o.supplier,
+    title: o.title,
+    url: o.url,
+    price: p,
+    regular_price: r,
+    on_sale: p != null && r != null && p < r,
+    in_stock: o.inStock ?? null,
+    image: o.image ?? null,
+    mpn: o.mpn ?? null,
+    sku: o.supplierSku ?? null,
+    score: 0,
+  };
+}
+
+/**
+ * Live fallback: the pre-built Vectorize index only holds what the cron has
+ * crawled, so a part that exists at a vendor but isn't indexed (e.g. a bare IC
+ * reachable only via robu's productSearch) would read as "no match". When the
+ * index comes up empty we fan out to the vendors' OWN search live — robu's real
+ * productSearch resolver + each WooCommerce store's ?search= — then rerank the
+ * merged hits. Fresh, exact, and it makes part-number lookups work. Results are
+ * flagged `live:true` so the UI can show "fetched live".
+ */
+async function liveFallback(u: Understanding, env: Env): Promise<ResultRow[]> {
+  const q = u.raw;
+  const tasks: Promise<Offer[]>[] = [
+    productSearchRobu(q).catch(() => []),
+    searchRobu(q, 8).catch(() => []),
+    ...WOO_SUPPLIERS.map((s) => searchWoo(s, q, 8).catch(() => [])),
+  ];
+  const settled = await Promise.all(tasks);
+  const byKey = new Map<string, Offer>();
+  for (const list of settled)
+    for (const o of list) {
+      if (!o.title || !o.url) continue;
+      const key = `${o.supplier}:${o.supplierProductId || o.supplierSku || o.url}`;
+      if (!byKey.has(key)) byKey.set(key, o);
+    }
+  const offers = [...byKey.values()];
+  if (offers.length === 0) return [];
+
+  // rerank the live hits against the clean semantic phrase
+  const rows = offers.map(offerToRow);
+  try {
+    const out = (await env.AI.run(env.RERANK_MODEL as keyof AiModels, {
+      query: u.semantic,
+      contexts: offers.map((o) => ({ text: `${o.title}. ${o.categories.join(", ")}` })),
+      top_k: offers.length,
+    } as any)) as any;
+    const rr: any[] = out?.response ?? out?.results ?? [];
+    for (const r of rr) {
+      const idx = r.id ?? r.index;
+      if (typeof idx === "number" && idx >= 0 && idx < rows.length)
+        rows[idx].score = (r.score ?? 0) + 0.5 * keywordHits(u, `${offers[idx].title} ${offers[idx].mpn ?? ""}`.toLowerCase());
+    }
+  } catch {
+    // no reranker -> lexical only
+    rows.forEach((row, i) => {
+      row.score = keywordHits(u, `${offers[i].title} ${offers[i].mpn ?? ""}`.toLowerCase()) + lexicalAdjust(q, offers[i].title, offers[i].mpn);
+    });
+  }
+  rows.sort((a, b) => b.score - a.score);
+  return rows;
+}
+
 /** How many of the understanding keywords appear in a title/mpn/categories blob. */
 function keywordHits(u: Understanding, blob: string): number {
   if (!u.keywords.length) return 0;
   let hits = 0;
   for (const k of u.keywords) if (k && blob.includes(k)) hits++;
   return hits / u.keywords.length; // 0..1
+}
+
+/**
+ * A "distinctive part token" is an alphanumeric run mixing letters AND digits,
+ * long enough to be a real MPN (e.g. stm32f765vit6, atmega328p, lm2596) rather
+ * than a plain word. These demand an EXACT presence: a query for stm32f765vit6
+ * must not be satisfied by a lukewarm stm32f407 family cousin.
+ */
+function partTokens(q: string): string[] {
+  return tokenize(q).filter(
+    (t) => t.length >= 5 && /[a-z]/.test(t) && /[0-9]/.test(t),
+  );
 }
 
 export async function handleSearch(url: URL, env: Env): Promise<Response> {
@@ -100,6 +183,7 @@ export async function handleSearch(url: URL, env: Env): Promise<Response> {
     return { text: cats ? `${t}. ${cats}` : t };
   });
   const rr: number[] = new Array(cands.length).fill(NaN);
+  let rrDiag: any = null;
   try {
     const out = (await env.AI.run(env.RERANK_MODEL as keyof AiModels, {
       query: u.semantic,
@@ -107,37 +191,48 @@ export async function handleSearch(url: URL, env: Env): Promise<Response> {
       top_k: contexts.length,
     } as any)) as any;
     const rows: any[] = out?.response ?? out?.results ?? [];
+    if (debug) rrDiag = { topKeys: Object.keys(out || {}), nrows: rows.length, sample: rows[0] };
     for (const row of rows) {
       const idx = row.id ?? row.index;
       if (typeof idx === "number" && idx >= 0 && idx < rr.length) rr[idx] = row.score ?? 0;
     }
-  } catch {
+  } catch (e) {
+    if (debug) rrDiag = { error: String(e) };
     // reranker unavailable -> fall back to vector score
   }
 
-  // normalize the semantic score to 0..1 across the candidate set, so the
-  // lexical/keyword adjustments below are on a comparable scale.
-  const sem = cands.map((c, i) => (Number.isFinite(rr[i]) ? rr[i] : c.vscore));
-  const lo = Math.min(...sem);
-  const hi = Math.max(...sem);
-  const span = hi - lo || 1;
-  const semNorm = sem.map((s) => (s - lo) / span);
+  // The reranker score is an ABSOLUTE relevance signal (a true match ~0.99, an
+  // unrelated item ~0.001), so keep it raw — do NOT min-max normalize, which
+  // would rescale the best of a garbage batch up to 1.0 and make "no stocked
+  // match" look identical to a perfect hit. When the reranker failed for every
+  // candidate we fall back to the cosine vector score, which lives on a higher,
+  // fuzzier band, so the relevance floor is chosen per-mode.
+  const reranked = rr.some((v) => Number.isFinite(v));
+  const RERANK_FLOOR = 0.02; // below this the reranker considers it unrelated
+  const VECTOR_FLOOR = 0.4; // cosine fallback: unrelated items still score ~0.3
+  const floor = reranked ? RERANK_FLOOR : VECTOR_FLOOR;
 
-  // 6) blend
-  const rows: ResultRow[] = cands.map((c, i) => {
+  // 6) score + relevance gate. A row survives if the semantic signal clears the
+  // floor OR an exact must-have keyword (part number / topology) is present —
+  // the hybrid rescue that lets a lexical exact-match through even when the
+  // embedding is lukewarm.
+  const scored = cands.map((c, i) => {
     const md = c.meta;
     const price = Number(md.price);
     const reg = Number(md.regular_price);
     const inStock = md.in_stock === "true" ? true : md.in_stock === "false" ? false : null;
     const blob = `${String(md.title || "")} ${String(md.mpn || "")} ${String(md.categories || "")}`.toLowerCase();
 
-    let score = semNorm[i]; // 0..1 semantic
-    score += 0.5 * keywordHits(u, blob); // must-have tokens (part numbers, topology)
-    score += 0.4 * lexicalAdjust(q, String(md.title || ""), md.mpn); // product-type bias
-    if (u.type && blob.includes(u.type)) score += 0.15; // category/type match
+    const semantic = Number.isFinite(rr[i]) ? rr[i] : c.vscore;
+    const kw = keywordHits(u, blob); // 0..1 fraction of must-have tokens present
+    let score = semantic;
+    score += 0.5 * kw;
+    score += 0.4 * lexicalAdjust(q, String(md.title || ""), md.mpn);
+    if (u.type && blob.includes(u.type)) score += 0.15;
     if (u.interface && blob.includes(u.interface)) score += 0.1;
 
-    return {
+    const relevant = semantic >= floor || kw > 0;
+    const row: ResultRow = {
       supplier: md.supplier,
       title: md.title,
       url: md.url,
@@ -150,7 +245,66 @@ export async function handleSearch(url: URL, env: Env): Promise<Response> {
       sku: md.sku || null,
       score,
     };
+    return { row, relevant };
   });
+
+  const rows: ResultRow[] = scored.filter((s) => s.relevant).map((s) => s.row);
+  let approximate = false; // true when we fall back to index family-cousins
+
+  // Exact part-number guard: if the query names a distinctive MPN token and NO
+  // indexed row actually contains it, whatever cleared the floor is only a
+  // family cousin (stm32f765vit6 → stm32f407). Force the live fallback so the
+  // exact part can surface, rather than confidently returning the wrong chip.
+  const wantTokens = partTokens(q);
+  const haveExact =
+    wantTokens.length === 0 ||
+    scored.some((s) => {
+      const blob = `${s.row.title} ${s.row.mpn ?? ""} ${s.row.sku ?? ""}`.toLowerCase();
+      return wantTokens.every((t) => blob.includes(t));
+    });
+
+  if (rows.length === 0 || !haveExact) {
+    // Nothing in the pre-built index cleared the relevance floor (or only a
+    // family cousin did). Try the vendors' own live search before giving up —
+    // this is what makes exact part numbers (bare ICs robu carries but we
+    // haven't crawled) resolve.
+    const live = inStockOnly
+      ? (await liveFallback(u, env)).filter((r) => r.in_stock === true)
+      : await liveFallback(u, env);
+    // Prefer an exact live hit for the part token when we have one.
+    const liveExact =
+      wantTokens.length === 0
+        ? live
+        : live.filter((r) => {
+            const blob = `${r.title} ${r.mpn ?? ""} ${r.sku ?? ""}`.toLowerCase();
+            return wantTokens.every((t) => blob.includes(t));
+          });
+    const chosen = liveExact.length > 0 ? liveExact : live;
+    if (chosen.length > 0) {
+      return json(env, {
+        query: q,
+        understanding: debug ? u : undefined,
+        count: chosen.length,
+        offers: chosen.slice(0, top),
+        live: true,
+        _diag: debug ? { reranked, floor, rrDiag, path: "live-fallback" } : undefined,
+      });
+    }
+    // No live hit. If the index had family-cousin rows, show them (labelled);
+    // otherwise it's a genuine no-match.
+    if (rows.length === 0) {
+      return json(env, {
+        query: q,
+        understanding: debug ? u : undefined,
+        count: 0,
+        offers: [],
+        message: "No match found across the indexed or live supplier catalogs.",
+        _diag: debug ? { reranked, floor, rrDiag } : undefined,
+      });
+    }
+    // fall through: return the index rows below, flagged as approximate
+    approximate = wantTokens.length > 0;
+  }
 
   rows.sort((a, b) => {
     const d = Math.round(b.score * 1000) - Math.round(a.score * 1000);
@@ -173,5 +327,10 @@ export async function handleSearch(url: URL, env: Env): Promise<Response> {
     understanding: debug ? u : undefined,
     count: rows.length,
     offers: rows.slice(0, top),
+    approximate: approximate || undefined,
+    message: approximate
+      ? "No exact part match; showing closest available parts."
+      : undefined,
+    _diag: debug ? { reranked, floor, rrDiag } : undefined,
   });
 }

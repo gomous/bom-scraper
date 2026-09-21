@@ -48,6 +48,10 @@
   a.view{color:var(--accent);text-decoration:none;font-size:12px;white-space:nowrap}
   a.view:hover{text-decoration:underline}
   .empty{color:var(--muted);text-align:center;padding:50px 0}
+  .tag{font-size:11px;padding:2px 7px;border-radius:10px;font-weight:600}
+  .tag.live{background:#0b7a3b;color:#fff}
+  .tag.approx{background:#8a6d0b;color:#fff}
+  .note{color:var(--muted);font-size:13px;margin:0 0 12px;padding:8px 12px;background:rgba(138,109,11,.12);border-radius:8px}
   .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--muted);
     border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
   @keyframes sp{to{transform:rotate(360deg)}}
@@ -104,8 +108,13 @@ async function run(e){
     const r=await fetch(`${API_BASE}/api/search?q=${encodeURIComponent(q)}&in_stock=${inStock}`);
     const d=await r.json();
     if(d.error){$('#status').textContent='Error: '+d.error;return;}
-    $('#status').innerHTML=`${d.count} result(s) for “${esc(d.query)}”`;
-    $('#results').innerHTML=d.offers.length?d.offers.map(card).join(''):'<div class="empty">No matches yet — the index may still be filling. Try a broader term.</div>';
+    let tag='';
+    if(d.live) tag=' · <span class="tag live">fetched live</span>';
+    else if(d.approximate) tag=' · <span class="tag approx">closest match</span>';
+    $('#status').innerHTML=`${d.count} result(s) for “${esc(d.query)}”${tag}`;
+    const banner=(d.approximate&&d.offers.length)?`<div class="note">${esc(d.message||'')}</div>`:'';
+    const emptyMsg=esc(d.message||'No matches yet — the index may still be filling. Try a broader term.');
+    $('#results').innerHTML=d.offers.length?banner+d.offers.map(card).join(''):`<div class="empty">${emptyMsg}</div>`;
   }catch(err){$('#status').textContent='Request failed (check API_BASE / CORS): '+err;}
   finally{$('#go').disabled=false;}
 }

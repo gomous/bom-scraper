@@ -78,3 +78,19 @@ export async function fetchWooPage(
   }
   return { offers: batch.map((p) => toOffer(sup, p)), totalPages, transient: false };
 }
+
+/** Live keyword search against one WooCommerce store's Store API (?search=). */
+export async function searchWoo(sup: WooSupplier, query: string, limit = 10): Promise<Offer[]> {
+  const url = new URL(`${sup.base}/wp-json/wc/store/products`);
+  url.searchParams.set("search", query);
+  url.searchParams.set("per_page", String(Math.min(limit, 20)));
+  const resp = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/json" } });
+  if (!resp.ok) return [];
+  const text = await resp.text();
+  if (!text.trim()) return [];
+  try {
+    return (JSON.parse(text) as any[]).map((p) => toOffer(sup, p));
+  } catch {
+    return [];
+  }
+}
