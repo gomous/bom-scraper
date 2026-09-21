@@ -68,7 +68,8 @@ function toOffer(p: any): Offer {
   const sale = num(p.sale_price);
   let img: string | null = null;
   if (Array.isArray(p.images) && p.images.length) img = p.images[0];
-  else if (typeof p.images === "string") img = p.images;
+  else if (typeof p.images === "string" && p.images) img = p.images;
+  else if (typeof p.image_url === "string" && p.image_url) img = p.image_url; // productSearch exposes image_url, not images[]
   let cats: string[] = [];
   if (Array.isArray(p.categories)) cats = p.categories.map((c: any) => String(c));
   else if (typeof p.categories === "string") cats = [p.categories];
@@ -134,7 +135,7 @@ export async function searchRobu(query: string, limit = 12): Promise<Offer[]> {
  */
 const PRODUCT_SEARCH_QUERY =
   "query BomPS($search:String!){ productSearch(search:$search){ data { products {" +
-  "id sku name slug price sale_price moq_price in_stock is_backorder } } } }";
+  "id sku name slug price sale_price moq_price in_stock is_backorder image_url } } } }";
 
 export async function productSearchRobu(query: string): Promise<Offer[]> {
   const data = await gql(PRODUCT_SEARCH_QUERY, { search: query });
