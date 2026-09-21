@@ -79,7 +79,7 @@ const esc=s=>(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"
 function stockBadge(s){if(s===true)return '<span class="badge in">in stock</span>';
   if(s===false)return '<span class="badge no">out of stock</span>';return '<span class="badge no">stock ?</span>';}
 function card(o){
-  const img=o.image?`<img src="${esc(o.image)}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'noimg'}))">`:'<div class="noimg"></div>';
+  const img=o.image?`<img src="${esc(o.image)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'noimg'}))">`:'<div class="noimg"></div>';
   const price=o.on_sale
     ? `<div class="now">${rupee(o.price)}</div><div class="was">${rupee(o.regular_price)}</div><div class="sale">SALE</div>`
     : `<div class="now">${rupee(o.price)}</div>`;
