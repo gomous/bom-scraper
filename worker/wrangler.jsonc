@@ -1,0 +1,39 @@
+{
+  // Cloudflare Worker: ingestion cron + search API for the BOM aggregator.
+  // Create the resources first (see README), then fill in index_name / KV id.
+  "name": "bom-aggregator",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Workers AI: embeddings (bge-small-en-v1.5) + reranker (bge-reranker-base)
+  "ai": { "binding": "AI" },
+
+  // Vectorize index. Create with:
+  //   wrangler vectorize create bom-products --dimensions=384 --metric=cosine
+  //   wrangler vectorize create-metadata-index bom-products --property-name=supplier --type=string
+  //   wrangler vectorize create-metadata-index bom-products --property-name=in_stock --type=string
+  "vectorize": [{ "binding": "VECTORIZE", "index_name": "bom-products" }],
+
+  // KV holds the ingestion cursor (which supplier/page to crawl next).
+  //   wrangler kv namespace create CURSOR   -> paste the id below
+  "kv_namespaces": [{ "binding": "CURSOR", "id": "6b1b4989137c4fe5a23ba56b18ebd464" }],
+
+  "vars": {
+    // Lock CORS to the GitHub Pages origin (no trailing slash).
+    "ALLOWED_ORIGIN": "https://gomous.github.io",
+    // Free tier allows 50 subrequests per invocation; keep the per-run crawl
+    // small and let successive cron ticks fill the index. See README.
+    "MAX_PAGES_PER_RUN": "6",
+    "EMBED_MODEL": "@cf/baai/bge-small-en-v1.5",
+    "RERANK_MODEL": "@cf/baai/bge-reranker-base",
+    // Query-understanding LLM: parses natural language into a clean semantic
+    // phrase + structured filters (voltage/current/price/interface). "-fast" is
+    // the low-latency variant; one call per search.
+    "QUERY_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast"
+  },
+
+  // Incremental crawl every 30 minutes (builds up + keeps prices fresh).
+  "triggers": { "crons": ["*/30 * * * *"] }
+}
