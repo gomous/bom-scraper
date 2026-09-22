@@ -45,4 +45,5 @@ export interface Env {
   RERANK_MODEL: string;
   QUERY_MODEL: string;
   INGEST_TOKEN?: string;
+  API_KEY?: string; // gates /api/lookup (the agent-facing search endpoint)
 }

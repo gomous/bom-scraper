@@ -4,17 +4,24 @@
  *   scheduled() — the cron-driven incremental ingestion into Vectorize.
  */
 import type { Env } from "./types";
-import { handleSearch, handleOptions } from "./search";
+import { handleSearch, handleLookup, handleOptions } from "./search";
 import { runIngest } from "./ingest";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    if (request.method === "OPTIONS") return handleOptions(env);
+    if (request.method === "OPTIONS") return handleOptions(url, env);
 
     if (url.pathname === "/api/search") {
       return handleSearch(url, env);
+    }
+
+    // Agent-facing, API-key-gated search (for Claude / other tools). Same engine
+    // as /api/search but returns a clean component-details shape and requires the
+    // API_KEY secret. See docs/AGENT_API.md.
+    if (url.pathname === "/api/lookup") {
+      return handleLookup(url, request, env);
     }
 
     // Manual ingestion trigger — bootstraps the index without waiting for cron.
@@ -36,7 +43,7 @@ export default {
 
     if (url.pathname === "/" || url.pathname === "/health") {
       return new Response(
-        JSON.stringify({ ok: true, service: "bom-aggregator", endpoints: ["/api/search?q="] }),
+        JSON.stringify({ ok: true, service: "bom-aggregator", endpoints: ["/api/search?q=", "/api/lookup?q= (key)"] }),
         { headers: { "Content-Type": "application/json" } },
       );
     }

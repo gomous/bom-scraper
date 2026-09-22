@@ -72,6 +72,16 @@ function corsHeaders(env: Env): Record<string, string> {
   };
 }
 
+/** Open CORS for the keyed agent endpoint: any origin, auth headers allowed. */
+function corsHeadersOpen(): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key",
+    "Access-Control-Max-Age": "86400",
+  };
+}
+
 function json(env: Env, body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -81,8 +91,9 @@ function json(env: Env, body: unknown, status = 200): Response {
 
 const STOCK_RANK: Record<string, number> = { true: 0, unknown: 1, false: 2 };
 
-export function handleOptions(env: Env): Response {
-  return new Response(null, { headers: corsHeaders(env) });
+export function handleOptions(url: URL, env: Env): Response {
+  const headers = url.pathname === "/api/lookup" ? corsHeadersOpen() : corsHeaders(env);
+  return new Response(null, { headers });
 }
 
 /** Collapse to bare alphanumerics so "MPU-6050", "mpu 6050" and "mpu6050" unify. */
@@ -210,12 +221,17 @@ async function rerank(cands: Cand[], query: string, env: Env): Promise<Map<strin
   return scores;
 }
 
-export async function handleSearch(url: URL, env: Env): Promise<Response> {
+interface SearchOut {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+async function runSearch(url: URL, env: Env): Promise<SearchOut> {
   const q = (url.searchParams.get("q") || "").trim();
   const inStockOnly = ["1", "true", "on"].includes(url.searchParams.get("in_stock") || "0");
   const top = Math.min(50, Math.max(1, parseInt(url.searchParams.get("top") || "24", 10)));
   const debug = url.searchParams.get("debug") === "1";
-  if (!q) return json(env, { error: "missing q" }, 400);
+  if (!q) return { status: 400, body: { error: "missing q" } };
 
   // 1) understand the query (LLM; falls back to the raw query on any failure)
   const u = await understandQuery(q, env);
@@ -241,13 +257,16 @@ export async function handleSearch(url: URL, env: Env): Promise<Response> {
   }
 
   if (lists.length === 0)
-    return json(env, {
-      query: q,
-      understanding: debug ? u : undefined,
-      count: 0,
-      offers: [],
-      message: "No match found across the indexed or live supplier catalogs.",
-    });
+    return {
+      status: 200,
+      body: {
+        query: q,
+        understanding: debug ? u : undefined,
+        count: 0,
+        offers: [],
+        message: "No match found across the indexed or live supplier catalogs.",
+      },
+    };
 
   // 3) fuse by RRF. The representative item prefers the dense-index row (passed
   //    first: it carries image + categories that robu's productSearch omits).
@@ -312,33 +331,88 @@ export async function handleSearch(url: URL, env: Env): Promise<Response> {
   }
 
   if (finalRanked.length === 0)
-    return json(env, {
-      query: q,
-      understanding: debug ? u : undefined,
-      count: 0,
-      offers: [],
-      message: "No match found across the indexed or live supplier catalogs.",
-      _diag: debug ? { reranked, lists: lists.map((l) => ({ name: l.name, n: l.items.length })) } : undefined,
-    });
+    return {
+      status: 200,
+      body: {
+        query: q,
+        understanding: debug ? u : undefined,
+        count: 0,
+        offers: [],
+        message: "No match found across the indexed or live supplier catalogs.",
+        _diag: debug ? { reranked, lists: lists.map((l) => ({ name: l.name, n: l.items.length })) } : undefined,
+      },
+    };
 
   const offers = finalRanked.slice(0, top).map((r) => candToRow(r.f.item, r.rr ?? r.f.score));
   const live_flag = finalRanked.slice(0, top).some((r) => r.liveOnly);
 
-  return json(env, {
-    query: q,
-    understanding: debug ? u : undefined,
-    count: finalRanked.length,
-    offers,
-    live: live_flag || undefined,
-    approximate: approximate || undefined,
-    message: approximate ? "No exact part match; showing closest available parts." : undefined,
-    _diag: debug
-      ? {
-          reranked,
-          lists: lists.map((l) => ({ name: l.name, n: l.items.length })),
-          fused: fused.length,
-          topRanks: finalRanked.slice(0, 5).map((r) => ({ key: r.f.key, exact: r.exact, rr: r.rr, rrf: r.f.score, ranks: r.f.ranks })),
-        }
-      : undefined,
-  });
+  return {
+    status: 200,
+    body: {
+      query: q,
+      understanding: debug ? u : undefined,
+      count: finalRanked.length,
+      offers,
+      live: live_flag || undefined,
+      approximate: approximate || undefined,
+      message: approximate ? "No exact part match; showing closest available parts." : undefined,
+      _diag: debug
+        ? {
+            reranked,
+            lists: lists.map((l) => ({ name: l.name, n: l.items.length })),
+            fused: fused.length,
+            topRanks: finalRanked.slice(0, 5).map((r) => ({ key: r.f.key, exact: r.exact, rr: r.rr, rrf: r.f.score, ranks: r.f.ranks })),
+          }
+        : undefined,
+    },
+  };
+}
+
+export async function handleSearch(url: URL, env: Env): Promise<Response> {
+  const { status, body } = await runSearch(url, env);
+  return json(env, body, status);
+}
+
+/**
+ * Read a bearer/x-api-key/?key credential and compare it to the API_KEY secret.
+ * Fails CLOSED: if API_KEY is unset the endpoint is unusable (never wide open).
+ */
+function checkApiKey(url: URL, req: Request, env: Env): boolean {
+  if (!env.API_KEY) return false;
+  const auth = req.headers.get("Authorization") || "";
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  const provided = bearer || req.headers.get("X-API-Key") || url.searchParams.get("key") || "";
+  return provided.length > 0 && provided === env.API_KEY;
+}
+
+/** Agent-facing, key-gated search. Returns component details in a clean, LLM-friendly shape. */
+export async function handleLookup(url: URL, req: Request, env: Env): Promise<Response> {
+  const headers = { "Content-Type": "application/json; charset=utf-8", ...corsHeadersOpen() };
+  if (!checkApiKey(url, req, env))
+    return new Response(JSON.stringify({ error: "unauthorized", hint: "pass the key via 'Authorization: Bearer <key>', 'X-API-Key: <key>', or '?key=<key>'" }), { status: 401, headers });
+
+  const { status, body } = await runSearch(url, env);
+  const offers = (body.offers as ResultRow[] | undefined) ?? [];
+  const components = offers.map((o) => ({
+    title: o.title,
+    supplier: o.supplier,
+    mpn: o.mpn,
+    sku: o.sku,
+    price_inr: o.price,
+    regular_price_inr: o.regular_price,
+    on_sale: o.on_sale,
+    in_stock: o.in_stock, // true / false / null(unknown)
+    url: o.url,
+    image: o.image,
+  }));
+  const out = {
+    query: body.query,
+    currency: "INR",
+    count: body.count ?? components.length,
+    live: body.live,
+    approximate: body.approximate,
+    note: body.message,
+    components,
+  };
+  return new Response(JSON.stringify(out), { status, headers });
 }
